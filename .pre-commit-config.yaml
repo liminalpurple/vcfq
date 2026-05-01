@@ -1,0 +1,82 @@
+default_install_hook_types:
+  - pre-commit
+  - commit-msg
+default_stages:
+  - pre-commit
+  - manual
+
+repos:
+  # File integrity and format checks - run first for efficiency
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: check-case-conflict
+      - id: check-json
+      - id: check-merge-conflict
+      - id: check-symlinks
+      - id: check-toml
+      - id: check-yaml
+      - id: destroyed-symlinks
+      - id: end-of-file-fixer
+      - id: fix-byte-order-marker
+      - id: mixed-line-ending
+      - id: trailing-whitespace
+        exclude: ^testdata/hardbreaks
+
+  # Conventional commit message format enforcement
+  - repo: https://github.com/compilerla/conventional-pre-commit
+    rev: v4.4.0
+    hooks:
+      - id: conventional-pre-commit
+        stages: [commit-msg]
+        args: ["--strict", "--force-scope"]
+
+  # Go language checks
+  - repo: local
+    hooks:
+      - id: gofmt
+        name: gofmt
+        entry: gofmt -l -w
+        language: system
+        types: [go]
+
+      - id: goimports
+        name: goimports
+        entry: sh -c 'go install golang.org/x/tools/cmd/goimports@latest && exec $(go env GOPATH)/bin/goimports -l -w "$@"' --
+        language: system
+        types: [go]
+
+      - id: go-get-update
+        name: go get -u
+        entry: sh -c 'GOWORK=off go get -u ./...'
+        language: system
+        types: [go]
+        pass_filenames: false
+
+      - id: go-mod-tidy
+        name: go mod tidy
+        entry: go mod tidy
+        language: system
+        files: go\.(mod|sum)$
+        pass_filenames: false
+
+      - id: golangci-lint
+        name: golangci-lint
+        entry: sh -c 'go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest && GOWORK=off $(go env GOPATH)/bin/golangci-lint run'
+        language: system
+        types: [go]
+        pass_filenames: false
+
+      - id: go-test
+        name: go test
+        entry: sh -c 'GOWORK=off go test -v ./...'
+        language: system
+        types: [go]
+        pass_filenames: false
+
+  # Markdown linting
+  - repo: https://github.com/DavidAnson/markdownlint-cli2
+    rev: v0.22.1
+    hooks:
+      - id: markdownlint-cli2
+        args: ["--fix"]
