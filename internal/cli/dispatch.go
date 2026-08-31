@@ -135,6 +135,13 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "error: close formatter:", err)
 		return 1
 	}
+
+	// After the output, so it reads as a footnote to the rows rather than
+	// splitting a table header from its body on an interleaved terminal.
+	if anyNoCall(allRecords) {
+		fmt.Fprintln(stderr, "note: no variant call is not the same as homozygous reference —")
+		fmt.Fprintln(stderr, "      verify coverage on the CRAM before interpreting an absence.")
+	}
 	return 0
 }
 
@@ -185,7 +192,27 @@ func resolveRSID(ctx context.Context, client *ensembl.Client, cache *ensembl.Cac
 	if len(matched) > 0 {
 		return matched, nil
 	}
+	if len(all) == 0 {
+		return []Record{noCallRecord(loc.Chrom, loc.Start, loc.ID, loc.Ref, loc.Alts, rsid)}, nil
+	}
 	return all, nil
+}
+
+// noCallRecord builds the synthetic row emitted when a single-position query
+// resolves cleanly but finds no line in the VCF. Reporting the resolved
+// coordinates is the whole point: an empty result tells you nothing about where
+// to look next, whereas "no call at chr6:32,638,107 (C/T)" is directly
+// actionable against the CRAM.
+func noCallRecord(chrom string, pos int, id, ref string, alts []string, query string) Record {
+	return Record{
+		Chrom:  chrom,
+		Pos:    pos,
+		ID:     id,
+		Ref:    ref,
+		Alt:    strings.Join(alts, ","),
+		Query:  query,
+		NoCall: true,
+	}
 }
 
 var regionParseRegex = regexp.MustCompile(`^((?:chr)?[\dXYMxym]+):(\d+)(?:-(\d+))?$`)
@@ -207,6 +234,11 @@ func resolveRegion(reader *vcf.Reader, region string) ([]Record, error) {
 	lines, err := reader.ScanRegion(chrom, start, end)
 	if err != nil {
 		return nil, err
+	}
+	// Only a single-position query has an unambiguous "this exact site had no
+	// call" reading. An empty range is just an empty range.
+	if len(lines) == 0 && start == end {
+		return []Record{noCallRecord(chrom, start, "", "", nil, region)}, nil
 	}
 	return splitToRecords(lines, region), nil
 }
@@ -244,21 +276,47 @@ func splitToRecords(lines []vcf.DataLine, query string) []Record {
 	return out
 }
 
+func anyNoCall(recs []Record) bool {
+	for _, r := range recs {
+		if r.NoCall {
+			return true
+		}
+	}
+	return false
+}
+
 func annotateRecords(ctx context.Context, client *ensembl.Client, cache *ensembl.Cache, recs []Record) error {
-	inputs := make([]ensembl.VEPInput, len(recs))
+	// No-call rows are deliberately excluded: annotating them would describe a
+	// variant the sample does not carry, in the same columns used for variants it
+	// does. targets keeps the mapping back from response index to record index.
+	var (
+		inputs  []ensembl.VEPInput
+		targets []int
+	)
 	for i, r := range recs {
-		inputs[i] = ensembl.VEPInput{Chrom: r.Chrom, Pos: r.Pos, Ref: r.Ref, Alt: r.Alt}
+		if r.NoCall {
+			continue
+		}
+		inputs = append(inputs, ensembl.VEPInput{Chrom: r.Chrom, Pos: r.Pos, Ref: r.Ref, Alt: r.Alt})
+		targets = append(targets, i)
+	}
+	if len(inputs) == 0 {
+		return nil
 	}
 	anns, err := client.AnnotateBatch(ctx, cache, inputs)
 	if err != nil {
 		return err
 	}
 	for i, a := range anns {
-		recs[i].HasAnnot = true
-		recs[i].Consequence = a.Consequence
-		recs[i].Gene = a.Gene
-		recs[i].AAChange = a.AAChange
-		recs[i].AF = a.AF
+		if i >= len(targets) {
+			break
+		}
+		rec := &recs[targets[i]]
+		rec.HasAnnot = true
+		rec.Consequence = a.Consequence
+		rec.Gene = a.Gene
+		rec.AAChange = a.AAChange
+		rec.AF = a.AF
 	}
 	return nil
 }

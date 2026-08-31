@@ -32,6 +32,34 @@ vcfq HNF1A MTHFR rs1801133
 echo 'HNF1A rs1801133 chr12:120978000-120998000' | vcfq
 ```
 
+## Absent variants
+
+A VCF stores non-reference calls only, so a site with no line is *usually* homozygous reference —
+but it may instead be a site that could not be called at all. Those are very different findings,
+and an empty result set cannot tell them apart.
+
+When a single-position query (an rsID, or a region with one coordinate) resolves cleanly but finds
+nothing in the VCF, vcfq reports the resolved position with a `no-call` genotype rather than
+printing nothing:
+
+```sh
+vcfq rs2187668 rs7454108
+# chrom  pos       id          ref  alt  gt       query
+# chr6   32638107  rs2187668   C    T    no-call  rs2187668
+# chr6   32713706  rs7454108   T    C    0/1      rs7454108
+# note: no variant call is not the same as homozygous reference —
+#       verify coverage on the CRAM before interpreting an absence.
+```
+
+The genotype is `no-call`, never `0/0`: vcfq knows only that no line exists at the position, not
+why, and distinguishing the two requires read-level data it does not touch. The note goes to
+stderr, so piped output stays clean.
+
+`ref`/`alt` on these rows come from Ensembl rather than the VCF — `-f json` marks this with
+`"source": "ensembl"`. `-a` skips them, since annotating a variant the sample does not carry would
+put it in the same columns as ones it does. `-f vcf` omits them, having no honest way to express an
+absence as a data line. Empty *ranges* stay empty; only a single position supports the claim.
+
 ## Annotation
 
 Pass `-a` (or `--annotate`) to enrich each variant with VEP consequence, gene symbol, amino acid
