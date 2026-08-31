@@ -49,9 +49,9 @@ func recordValues(rec Record, annotated bool) []string {
 		rec.Chrom,
 		strconv.Itoa(rec.Pos),
 		emptyDot(rec.ID),
-		rec.Ref,
-		rec.Alt,
-		emptyDot(rec.GT),
+		emptyDot(rec.Ref),
+		emptyDot(rec.Alt),
+		gtDisplay(rec),
 		rec.Query,
 	}
 	if annotated {
@@ -67,6 +67,16 @@ func recordValues(rec Record, annotated bool) []string {
 		)
 	}
 	return vals
+}
+
+// gtDisplay renders the genotype cell. No-call rows report "no-call" rather than
+// a genotype, which is a weaker and more accurate claim than "0/0": vcfq knows
+// only that the VCF has no line at the position, not why.
+func gtDisplay(rec Record) string {
+	if rec.NoCall {
+		return "no-call"
+	}
+	return emptyDot(rec.GT)
 }
 
 func emptyDot(s string) string {
@@ -158,6 +168,7 @@ type jsonRow struct {
 	Alt         string   `json:"alt"`
 	GT          string   `json:"gt,omitempty"`
 	Query       string   `json:"query"`
+	Source      string   `json:"source,omitempty"`
 	Consequence string   `json:"consequence,omitempty"`
 	Gene        string   `json:"gene,omitempty"`
 	AAChange    string   `json:"aa_change,omitempty"`
@@ -173,6 +184,12 @@ func (f *jsonFormatter) Write(rec Record) error {
 		Alt:   rec.Alt,
 		GT:    rec.GT,
 		Query: rec.Query,
+	}
+	if rec.NoCall {
+		// ref/alt on these rows are Ensembl's, not the VCF's — say so, since a
+		// consumer joining on this output has no other way to tell.
+		row.GT = "no-call"
+		row.Source = "ensembl"
 	}
 	if f.annotated && rec.HasAnnot {
 		row.Consequence = rec.Consequence
@@ -244,6 +261,13 @@ func (f *vcfFormatter) Header(vcfHeader []string, annotated bool) error {
 }
 
 func (f *vcfFormatter) Write(rec Record) error {
+	// A no-call has no honest VCF data-line representation — every genotype this
+	// format can express is a claim vcfq is not entitled to make. Skip the row and
+	// let the stderr note carry it. (A ##vcfq_nocall header line would preserve it
+	// for this format; see CLAUDE.md.)
+	if rec.NoCall {
+		return nil
+	}
 	info := rec.Info
 	if f.annotated && rec.HasAnnot {
 		info = appendAnnotations(info, rec)
