@@ -28,8 +28,10 @@ Queries are auto-detected:
   CHR:START[-END]     genomic region in GRCh38 (e.g. chr1:11796000-11796500)
   SYMBOL              gene symbol (e.g. HNF1A)
 
-Multiple queries may be passed as arguments or piped on stdin (whitespace
-separated). Stdin is consumed only when not attached to a terminal.
+Multiple queries may be passed as arguments, or piped on stdin (whitespace
+separated) when no arguments are given. To combine the two, pass "-" where the
+stdin queries should go. Stdin is otherwise never read, so arguments are safe
+to use from scripts and cron jobs.
 
 Flags:
 `
@@ -74,8 +76,11 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return 2
 	}
 
-	queries := append([]string(nil), fs.Args()...)
-	queries = append(queries, readStdinTokens(stdin)...)
+	queries, err := collectQueries(fs.Args(), stdin)
+	if err != nil {
+		diag(stderr, "error: read stdin:", err)
+		return 1
+	}
 	if len(queries) == 0 {
 		printUsageTo(stderr, fs)
 		return 2

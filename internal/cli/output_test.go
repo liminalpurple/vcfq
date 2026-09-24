@@ -2,6 +2,8 @@ package cli
 
 import (
 	"bytes"
+	"io"
+	"slices"
 	"strings"
 	"testing"
 
@@ -114,4 +116,53 @@ func TestRegionNoCallEndToEnd(t *testing.T) {
 	if out := runVCFQ(t, "-f", "vcf", "chr1:11796320"); len(dataLines(out)) != 0 {
 		t.Errorf("-f vcf should omit no-call rows, got:\n%s", out)
 	}
+}
+
+// forbiddenStdin fails the test if read: it stands in for a stdin inherited
+// from a script or cron job that is open but will never reach EOF.
+type forbiddenStdin struct{ t *testing.T }
+
+func (f forbiddenStdin) Read([]byte) (int, error) {
+	f.t.Error("stdin was read although queries were given as arguments")
+	return 0, io.EOF
+}
+
+func runWithStdin(t *testing.T, stdin io.Reader, args ...string) string {
+	t.Helper()
+	var stdout, stderr bytes.Buffer
+	args = append([]string{"-vcf", fixtureVCF, "-cache", t.TempDir()}, args...)
+	if code := Run(args, stdin, &stdout, &stderr); code != 0 {
+		t.Fatalf("Run(%q) exited %d: %s", args, code, stderr.String())
+	}
+	return stdout.String()
+}
+
+func queryColumn(out string) []string {
+	var qs []string
+	for _, l := range dataLines(out)[1:] {
+		f := strings.Split(l, "\t")
+		qs = append(qs, f[len(f)-1])
+	}
+	return qs
+}
+
+func TestStdinOnlyReadWhenAsked(t *testing.T) {
+	t.Run("arguments leave stdin alone", func(t *testing.T) {
+		got := queryColumn(runWithStdin(t, forbiddenStdin{t}, "chr2:100"))
+		if !slices.Equal(got, []string{"chr2:100"}) {
+			t.Errorf("queries = %v", got)
+		}
+	})
+	t.Run("no arguments reads stdin", func(t *testing.T) {
+		got := queryColumn(runWithStdin(t, strings.NewReader("chr2:100\nchr1:11796321\n")))
+		if !slices.Equal(got, []string{"chr2:100", "chr1:11796321"}) {
+			t.Errorf("queries = %v", got)
+		}
+	})
+	t.Run("dash splices stdin in place", func(t *testing.T) {
+		got := queryColumn(runWithStdin(t, strings.NewReader("chr2:100"), "chr1:11796321", "-", "chr1:20000100"))
+		if !slices.Equal(got, []string{"chr1:11796321", "chr2:100", "chr1:20000100"}) {
+			t.Errorf("queries = %v", got)
+		}
+	})
 }
