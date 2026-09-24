@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -19,24 +20,41 @@ const DefaultBaseURL = "https://rest.ensembl.org"
 // 10 rps stays comfortably under it for shared infrastructure courtesy.
 const DefaultRateLimit = 10
 
+// DefaultAttempts is how many times a request is tried before its last error is
+// returned. Ensembl's load balancer intermittently fronts unhealthy backends, so
+// a 5xx or timeout on one attempt says little about the next.
+const DefaultAttempts = 3
+
+// DefaultRetryBase is the delay before the first retry; each later retry
+// doubles it.
+const DefaultRetryBase = time.Second
+
+// maxRetryAfter caps how long a 429's Retry-After header can make us wait.
+const maxRetryAfter = time.Minute
+
 // Client is a rate-limited Ensembl REST client.
 type Client struct {
 	BaseURL    string
 	HTTP       *http.Client
 	UserAgent  string
+	Attempts   int
+	RetryBase  time.Duration
 	limiter    <-chan time.Time
 	limiterDur time.Duration
 }
 
-// NewClient returns a client with the default base URL, a 30s HTTP timeout, and
-// 10 rps rate limiting. version is reported in the User-Agent. The caller may
-// override fields directly after construction.
+// NewClient returns a client with the default base URL, a 15s timeout per
+// attempt, 10 rps rate limiting, and up to 3 attempts per request. version is
+// reported in the User-Agent. The caller may override fields directly after
+// construction.
 func NewClient(version string) *Client {
 	dur := time.Second / time.Duration(DefaultRateLimit)
 	return &Client{
 		BaseURL:    DefaultBaseURL,
-		HTTP:       &http.Client{Timeout: 30 * time.Second},
+		HTTP:       &http.Client{Timeout: 15 * time.Second},
 		UserAgent:  "vcfq/" + version + " (+https://github.com/liminalpurple/vcfq)",
+		Attempts:   DefaultAttempts,
+		RetryBase:  DefaultRetryBase,
 		limiter:    time.Tick(dur),
 		limiterDur: dur,
 	}
@@ -70,12 +88,37 @@ func (c *Client) postJSON(ctx context.Context, path string, body, dest any) erro
 	return c.do(ctx, http.MethodPost, path, bb, dest)
 }
 
-// do performs one rate-limited request, decoding the JSON response into dest.
+// do performs a rate-limited request, decoding the JSON response into dest.
+// Transport errors (including timeouts), 5xx and 429 responses are retried with
+// exponential backoff, honouring Retry-After on 429; other 4xx responses fail
+// immediately. After the last attempt the last error is returned unchanged.
 // Returns ErrNotFound for HTTP 404s so callers can distinguish "no such symbol"
 // from "network down".
-func (c *Client) do(ctx context.Context, method, path string, body []byte, dest any) (err error) {
+func (c *Client) do(ctx context.Context, method, path string, body []byte, dest any) error {
+	delay := c.RetryBase
+	for attempt := 1; ; attempt++ {
+		retryAfter, err := c.attempt(ctx, method, path, body, dest)
+		if err == nil || retryAfter < 0 || attempt >= c.Attempts || ctx.Err() != nil {
+			return err
+		}
+		wait := max(delay, retryAfter)
+		delay *= 2
+		t := time.NewTimer(wait)
+		select {
+		case <-t.C:
+		case <-ctx.Done():
+			t.Stop()
+			return err
+		}
+	}
+}
+
+// attempt performs one rate-limited request. On failure, retryAfter reports
+// whether it is worth retrying: negative means never, otherwise it is the
+// minimum wait the server asked for (zero if it didn't say).
+func (c *Client) attempt(ctx context.Context, method, path string, body []byte, dest any) (retryAfter time.Duration, err error) {
 	if err := c.wait(ctx); err != nil {
-		return err
+		return -1, err
 	}
 	url := c.BaseURL + path
 	if !strings.Contains(path, "?") {
@@ -87,7 +130,7 @@ func (c *Client) do(ctx context.Context, method, path string, body []byte, dest 
 	}
 	req, err := http.NewRequestWithContext(ctx, method, url, rb)
 	if err != nil {
-		return err
+		return -1, err
 	}
 	req.Header.Set("Accept", "application/json")
 	if body != nil {
@@ -96,7 +139,7 @@ func (c *Client) do(ctx context.Context, method, path string, body []byte, dest 
 	req.Header.Set("User-Agent", c.UserAgent)
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
-		return fmt.Errorf("ensembl %s %s: %w", method, path, err)
+		return 0, fmt.Errorf("ensembl %s %s: %w", method, path, err)
 	}
 	defer func() {
 		if cerr := resp.Body.Close(); cerr != nil {
@@ -105,18 +148,37 @@ func (c *Client) do(ctx context.Context, method, path string, body []byte, dest 
 	}()
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return fmt.Errorf("ensembl %s %s: read body: %w", method, path, err)
+		return 0, fmt.Errorf("ensembl %s %s: read body: %w", method, path, err)
 	}
 	if resp.StatusCode == http.StatusNotFound {
-		return ErrNotFound
+		return -1, ErrNotFound
 	}
 	if resp.StatusCode >= 400 {
-		return fmt.Errorf("ensembl %s %s: status %d: %s", method, path, resp.StatusCode, truncate(string(respBody), 200))
+		err := fmt.Errorf("ensembl %s %s: status %d: %s", method, path, resp.StatusCode, truncate(string(respBody), 200))
+		switch {
+		case resp.StatusCode == http.StatusTooManyRequests:
+			return parseRetryAfter(resp.Header.Get("Retry-After")), err
+		case resp.StatusCode >= 500:
+			return 0, err
+		default:
+			return -1, err
+		}
 	}
 	if err := json.Unmarshal(respBody, dest); err != nil {
-		return fmt.Errorf("ensembl %s %s: decode: %w", method, path, err)
+		return -1, fmt.Errorf("ensembl %s %s: decode: %w", method, path, err)
 	}
-	return nil
+	return 0, nil
+}
+
+// parseRetryAfter reads a Retry-After header in seconds. Ensembl sends
+// fractional values, so it is parsed as a float. Missing or unparseable values
+// give zero, leaving the backoff delay in charge.
+func parseRetryAfter(v string) time.Duration {
+	secs, err := strconv.ParseFloat(strings.TrimSpace(v), 64)
+	if err != nil || secs <= 0 {
+		return 0
+	}
+	return min(time.Duration(secs*float64(time.Second)), maxRetryAfter)
 }
 
 // ErrNotFound is returned when Ensembl responds with HTTP 404 — typically an
