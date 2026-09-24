@@ -257,8 +257,7 @@ func (f *vcfFormatter) Header(vcfHeader []string, annotated bool) error {
 func (f *vcfFormatter) Write(rec Record) error {
 	// A no-call has no honest VCF data-line representation — every genotype this
 	// format can express is a claim vcfq is not entitled to make. Skip the row and
-	// let the stderr note carry it. (A ##vcfq_nocall header line would preserve it
-	// for this format; see CLAUDE.md.)
+	// let the stderr note carry it.
 	if rec.NoCall {
 		return nil
 	}
