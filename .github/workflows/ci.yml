@@ -15,6 +15,6 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - uses: j178/prek-action@v3
+      - uses: j178/prek-action@v3.0.0
         env:
           SKIP: go-get-update
