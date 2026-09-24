@@ -27,10 +27,23 @@ vcfq rs1801133
 # By genomic region (GRCh38, 1-based inclusive)
 vcfq chr1:11796000-11796500
 
-# Multiple queries in one go (CLI args, stdin, or both)
+# Multiple queries in one go
 vcfq HNF1A MTHFR rs1801133
-echo 'HNF1A rs1801133 chr12:120978000-120998000' | vcfq
 ```
+
+### Queries from stdin
+
+With no query arguments, vcfq reads whitespace-separated queries from stdin. To mix arguments and
+stdin, pass `-` where the stdin queries should go — they're spliced in at that position:
+
+```sh
+echo 'HNF1A rs1801133 chr12:120978000-120998000' | vcfq
+vcfq -f json < queries.txt
+cut -f1 hits.tsv | vcfq MTHFR - rs53576
+```
+
+When queries are given as arguments and there's no `-`, stdin is never read, so vcfq won't wait on
+an inherited stdin in scripts, cron jobs, or CI.
 
 ## Absent variants
 
