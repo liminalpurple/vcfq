@@ -30,57 +30,60 @@ type Reader struct {
 }
 
 // Open reads the VCF header and loads the tabix index from path+".tbi".
-func Open(path string) (*Reader, error) {
+func Open(path string) (_ *Reader, err error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, fmt.Errorf("open vcf: %w", err)
 	}
-	bgz, err := bgzf.NewReader(f, 1)
-	if err != nil {
-		f.Close()
+	r := &Reader{path: path, f: f}
+	defer func() {
+		if err != nil {
+			err = errors.Join(err, r.Close())
+		}
+	}()
+	if r.bgz, err = bgzf.NewReader(f, 1); err != nil {
 		return nil, fmt.Errorf("bgzf: %w", err)
 	}
-
-	idxF, err := os.Open(path + ".tbi")
-	if err != nil {
-		bgz.Close()
-		f.Close()
-		return nil, fmt.Errorf("open tabix index (%s.tbi): %w", path, err)
+	if r.idx, err = readIndex(path + ".tbi"); err != nil {
+		return nil, err
 	}
-	defer idxF.Close()
-	// .tbi is bgzipped; gzip.Reader handles bgzf streams transparently.
-	gz, err := gzip.NewReader(idxF)
-	if err != nil {
-		bgz.Close()
-		f.Close()
-		return nil, fmt.Errorf("decompress tabix index: %w", err)
-	}
-	idx, err := tabix.ReadFrom(gz)
-	gz.Close()
-	if err != nil {
-		bgz.Close()
-		f.Close()
-		return nil, fmt.Errorf("read tabix index: %w", err)
-	}
-
-	r := &Reader{path: path, f: f, bgz: bgz, idx: idx}
 	if err := r.readHeader(); err != nil {
-		r.Close()
 		return nil, err
 	}
 	r.buildNameMap()
 	return r, nil
 }
 
+// readIndex loads a tabix index. The .tbi file is bgzipped, which gzip.Reader
+// handles transparently as a multi-member gzip stream.
+func readIndex(path string) (_ *tabix.Index, err error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("open tabix index (%s): %w", path, err)
+	}
+	defer func() { err = errors.Join(err, f.Close()) }()
+	gz, err := gzip.NewReader(f)
+	if err != nil {
+		return nil, fmt.Errorf("decompress tabix index: %w", err)
+	}
+	defer func() { err = errors.Join(err, gz.Close()) }()
+	idx, err := tabix.ReadFrom(gz)
+	if err != nil {
+		return nil, fmt.Errorf("read tabix index: %w", err)
+	}
+	return idx, nil
+}
+
 // Close releases the underlying file handles.
 func (r *Reader) Close() error {
+	var errs []error
 	if r.bgz != nil {
-		_ = r.bgz.Close()
+		errs = append(errs, r.bgz.Close())
 	}
 	if r.f != nil {
-		return r.f.Close()
+		errs = append(errs, r.f.Close())
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 // readHeader scans from the start of the bgzip stream and collects every line
@@ -150,7 +153,7 @@ type DataLine struct {
 // 1-based interval [start, end] on chrom. Tabix narrows to a bin; we filter
 // the precise interval ourselves. Multi-allelic ALT fields stay packed into
 // DataLine.Alts and are split downstream.
-func (r *Reader) ScanRegion(chrom string, start, end int) ([]DataLine, error) {
+func (r *Reader) ScanRegion(chrom string, start, end int) (_ []DataLine, err error) {
 	canonical := r.resolveChrom(chrom)
 	if canonical == "" {
 		return nil, fmt.Errorf("chrom %q not present in tabix index for %s", chrom, r.path)
@@ -158,7 +161,7 @@ func (r *Reader) ScanRegion(chrom string, start, end int) ([]DataLine, error) {
 	// Tabix's Chunks API uses 0-based half-open coords.
 	chunks, err := r.idx.Chunks(canonical, start-1, end)
 	if err != nil {
-		if errors.Is(err, errNoRef()) {
+		if errors.Is(err, bgzfindex.ErrNoReference) {
 			return nil, nil
 		}
 		return nil, fmt.Errorf("tabix chunks: %w", err)
@@ -171,7 +174,7 @@ func (r *Reader) ScanRegion(chrom string, start, end int) ([]DataLine, error) {
 	if err != nil {
 		return nil, fmt.Errorf("bgzf chunk reader: %w", err)
 	}
-	defer cr.Close()
+	defer func() { err = errors.Join(err, cr.Close()) }()
 	sc := bufio.NewScanner(cr)
 	sc.Buffer(make([]byte, 0, 64*1024), 1<<22)
 
@@ -201,12 +204,6 @@ func (r *Reader) ScanRegion(chrom string, start, end int) ([]DataLine, error) {
 		return nil, fmt.Errorf("scan chunk: %w", err)
 	}
 	return out, nil
-}
-
-// errNoRef returns the index.ErrNoReference sentinel as a generic error so we
-// can compare without importing biogo's internal index package.
-func errNoRef() error {
-	return errors.New("no reference")
 }
 
 // parseDataLine splits a VCF data line into columns. Returns ok=false on lines

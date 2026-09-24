@@ -1,6 +1,9 @@
 package vcf
 
-import "testing"
+import (
+	"slices"
+	"testing"
+)
 
 func TestParseGT(t *testing.T) {
 	cases := []struct {
@@ -20,23 +23,27 @@ func TestParseGT(t *testing.T) {
 	}
 }
 
-func TestAltIndex(t *testing.T) {
+func TestCalledAlts(t *testing.T) {
 	cases := []struct {
 		gt   string
-		want int
+		want []int
 	}{
-		{"0/0", 0},
-		{"0/1", 1},
-		{"1/1", 1},
-		{"1/2", 2},
-		{"2/3", 3},
-		{"0|1", 1},
-		{"./.", -1},
-		{"", -1},
+		{"0/0", nil},
+		{"0/1", []int{1}},
+		{"1/1", []int{1}},
+		{"1/2", []int{1, 2}},
+		{"2/1", []int{1, 2}},
+		{"0/2", []int{2}},
+		{"0|1", []int{1}},
+		{"1", []int{1}}, // haploid
+		{"./.", nil},
+		{"./1", []int{1}},
+		{"", nil},
+		{"a/1", nil},
 	}
 	for _, c := range cases {
-		if got := AltIndex(c.gt); got != c.want {
-			t.Errorf("AltIndex(%q) = %d, want %d", c.gt, got, c.want)
+		if got := CalledAlts(c.gt); !slices.Equal(got, c.want) {
+			t.Errorf("CalledAlts(%q) = %v, want %v", c.gt, got, c.want)
 		}
 	}
 }

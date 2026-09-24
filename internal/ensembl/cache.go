@@ -71,15 +71,15 @@ func (c *Cache) Set(kind, key string, val any) error {
 	}
 	tmpName := tmp.Name()
 	if _, err := tmp.Write(b); err != nil {
-		tmp.Close()
-		os.Remove(tmpName)
-		return err
+		return errors.Join(err, tmp.Close(), os.Remove(tmpName))
 	}
 	if err := tmp.Close(); err != nil {
-		os.Remove(tmpName)
-		return err
+		return errors.Join(err, os.Remove(tmpName))
 	}
-	return os.Rename(tmpName, path)
+	if err := os.Rename(tmpName, path); err != nil {
+		return errors.Join(err, os.Remove(tmpName))
+	}
+	return nil
 }
 
 // Clean removes every cached entry.

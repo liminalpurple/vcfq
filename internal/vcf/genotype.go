@@ -1,6 +1,10 @@
 package vcf
 
-import "strings"
+import (
+	"slices"
+	"strconv"
+	"strings"
+)
 
 // ParseGT extracts the GT subfield from a VCF FORMAT/sample pair. Returns ""
 // if the format doesn't include GT or the sample column is missing values for
@@ -22,34 +26,23 @@ func ParseGT(format, sample string) string {
 	return ""
 }
 
-// AltIndex returns the 1-based ALT allele index that a genotype calls, or 0 if
-// the genotype is homozygous reference, or -1 if the genotype is missing or
-// can't be parsed unambiguously. For diploid genotypes, AltIndex returns the
-// highest non-zero allele index — sufficient for vcfq's purpose of selecting
-// which ALT to display when a record has multiple ALTs.
-func AltIndex(gt string) int {
-	if gt == "" || gt == "." || gt == "./." || gt == ".|." {
-		return -1
-	}
-	sep := "/"
-	if strings.Contains(gt, "|") {
-		sep = "|"
-	}
-	max := 0
-	for _, a := range strings.Split(gt, sep) {
+// CalledAlts returns the distinct 1-based ALT indices a genotype calls, in
+// ascending order: "1/2" gives [1 2], "0/1" gives [1]. It returns nil for
+// homozygous reference, missing, or unparseable genotypes.
+func CalledAlts(gt string) []int {
+	var out []int
+	for _, a := range strings.FieldsFunc(gt, func(r rune) bool { return r == '/' || r == '|' }) {
 		if a == "." {
 			continue
 		}
-		n := 0
-		for _, c := range a {
-			if c < '0' || c > '9' {
-				return -1
-			}
-			n = n*10 + int(c-'0')
+		n, err := strconv.Atoi(a)
+		if err != nil || n < 0 {
+			return nil
 		}
-		if n > max {
-			max = n
+		if n > 0 && !slices.Contains(out, n) {
+			out = append(out, n)
 		}
 	}
-	return max
+	slices.Sort(out)
+	return out
 }

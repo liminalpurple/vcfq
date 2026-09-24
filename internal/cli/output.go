@@ -213,17 +213,22 @@ func (f *jsonFormatter) Close() error { return nil }
 // --- vcf ---
 
 // annotationInfoLines are appended to the source header (just before #CHROM) when
-// annotations are enabled. Order is stable for reproducible output.
+// annotations are enabled. Order is stable for reproducible output. Each field is
+// Number=A: one value per ALT on the line, "." for ALTs that weren't annotated.
 var annotationInfoLines = []string{
-	`##INFO=<ID=VCFQ_CONSEQUENCE,Number=1,Type=String,Description="VEP consequence term">`,
-	`##INFO=<ID=VCFQ_GENE,Number=1,Type=String,Description="VEP-resolved gene symbol">`,
-	`##INFO=<ID=VCFQ_AA,Number=1,Type=String,Description="Amino acid change (ref/alt)">`,
-	`##INFO=<ID=VCFQ_AF,Number=1,Type=Float,Description="Allele frequency from VEP (gnomAD/1000G)">`,
+	`##INFO=<ID=VCFQ_CONSEQUENCE,Number=A,Type=String,Description="VEP consequence term">`,
+	`##INFO=<ID=VCFQ_GENE,Number=A,Type=String,Description="VEP-resolved gene symbol">`,
+	`##INFO=<ID=VCFQ_AA,Number=A,Type=String,Description="Amino acid change (ref/alt)">`,
+	`##INFO=<ID=VCFQ_AF,Number=A,Type=Float,Description="Allele frequency from VEP (gnomAD/1000G)">`,
 }
 
+// vcfFormatter writes each source VCF line once, unsplit, with its original ALT
+// list and sample column. Records arrive split per ALT, so consecutive records
+// sharing a Line are buffered and emitted together.
 type vcfFormatter struct {
 	w         io.Writer
 	annotated bool
+	pending   []Record
 }
 
 func (f *vcfFormatter) Header(vcfHeader []string, annotated bool) error {
@@ -232,18 +237,7 @@ func (f *vcfFormatter) Header(vcfHeader []string, annotated bool) error {
 	// final #CHROM... line. If the source has no header (empty slice), emit a
 	// minimal one.
 	if len(vcfHeader) == 0 {
-		if _, err := fmt.Fprintln(f.w, "##fileformat=VCFv4.2"); err != nil {
-			return err
-		}
-		if annotated {
-			for _, line := range annotationInfoLines {
-				if _, err := fmt.Fprintln(f.w, line); err != nil {
-					return err
-				}
-			}
-		}
-		_, err := fmt.Fprintln(f.w, "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO")
-		return err
+		vcfHeader = []string{"##fileformat=VCFv4.2", "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO"}
 	}
 	for _, line := range vcfHeader {
 		if strings.HasPrefix(line, "#CHROM") && annotated {
@@ -268,48 +262,89 @@ func (f *vcfFormatter) Write(rec Record) error {
 	if rec.NoCall {
 		return nil
 	}
-	info := rec.Info
-	if f.annotated && rec.HasAnnot {
-		info = appendAnnotations(info, rec)
+	if rec.Line == nil {
+		return fmt.Errorf("vcf output: record %s:%d has no source line", rec.Chrom, rec.Pos)
 	}
+	if len(f.pending) > 0 && f.pending[0].Line != rec.Line {
+		if err := f.flush(); err != nil {
+			return err
+		}
+	}
+	f.pending = append(f.pending, rec)
+	return nil
+}
+
+func (f *vcfFormatter) Close() error { return f.flush() }
+
+func (f *vcfFormatter) flush() error {
+	if len(f.pending) == 0 {
+		return nil
+	}
+	d := f.pending[0].Line
+	info := d.Info
+	if f.annotated {
+		info = appendAnnotations(info, len(d.Alts), f.pending)
+	}
+	f.pending = f.pending[:0]
 	cols := []string{
-		rec.Chrom,
-		strconv.Itoa(rec.Pos),
-		emptyDot(rec.ID),
-		rec.Ref,
-		rec.Alt,
-		emptyDot(rec.Qual),
-		emptyDot(rec.Filter),
+		d.Chrom,
+		strconv.Itoa(d.Pos),
+		emptyDot(d.ID),
+		d.Ref,
+		strings.Join(d.Alts, ","),
+		emptyDot(d.Qual),
+		emptyDot(d.Filter),
 		emptyDot(info),
 	}
-	if rec.Format != "" {
-		cols = append(cols, rec.Format)
-		if rec.Sample != "" {
-			cols = append(cols, rec.Sample)
+	if d.Format != "" {
+		cols = append(cols, d.Format)
+		if d.Sample != "" {
+			cols = append(cols, d.Sample)
 		}
 	}
 	_, err := fmt.Fprintln(f.w, strings.Join(cols, "\t"))
 	return err
 }
 
-func (f *vcfFormatter) Close() error { return nil }
-
-// appendAnnotations injects VCFQ_* INFO fields into an existing INFO string. If
-// the source INFO is empty or ".", they replace it; otherwise they're appended
+// appendAnnotations injects Number=A VCFQ_* INFO fields into an existing INFO
+// string, with one value per ALT (nAlts of them) taken from the annotated
+// records for that line. A field with no value for any ALT is omitted. If the
+// source INFO is empty or ".", the fields replace it; otherwise they're appended
 // with ";" separators.
-func appendAnnotations(info string, rec Record) string {
-	parts := []string{}
-	if rec.Consequence != "" {
-		parts = append(parts, "VCFQ_CONSEQUENCE="+escapeInfoValue(rec.Consequence))
+func appendAnnotations(info string, nAlts int, recs []Record) string {
+	fields := []struct {
+		key   string
+		value func(Record) string
+	}{
+		{"VCFQ_CONSEQUENCE", func(r Record) string { return escapeInfoValue(r.Consequence) }},
+		{"VCFQ_GENE", func(r Record) string { return escapeInfoValue(r.Gene) }},
+		{"VCFQ_AA", func(r Record) string { return escapeInfoValue(r.AAChange) }},
+		{"VCFQ_AF", func(r Record) string {
+			if r.AF <= 0 {
+				return ""
+			}
+			return strconv.FormatFloat(r.AF, 'g', 4, 64)
+		}},
 	}
-	if rec.Gene != "" {
-		parts = append(parts, "VCFQ_GENE="+escapeInfoValue(rec.Gene))
-	}
-	if rec.AAChange != "" {
-		parts = append(parts, "VCFQ_AA="+escapeInfoValue(rec.AAChange))
-	}
-	if rec.AF > 0 {
-		parts = append(parts, "VCFQ_AF="+strconv.FormatFloat(rec.AF, 'g', 4, 64))
+	var parts []string
+	for _, fld := range fields {
+		vals := make([]string, nAlts)
+		found := false
+		for i := range vals {
+			vals[i] = "."
+		}
+		for _, r := range recs {
+			if !r.HasAnnot || r.AltIndex < 1 || r.AltIndex > nAlts {
+				continue
+			}
+			if v := fld.value(r); v != "" {
+				vals[r.AltIndex-1] = v
+				found = true
+			}
+		}
+		if found {
+			parts = append(parts, fld.key+"="+strings.Join(vals, ","))
+		}
 	}
 	added := strings.Join(parts, ";")
 	if added == "" {
