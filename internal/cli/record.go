@@ -2,19 +2,22 @@
 // stdin pipe handling, and output formatters.
 package cli
 
-// Record is one variant row produced by a query. VCF columns are kept separately
-// so the vcf formatter can reassemble lines with annotations injected into INFO.
+import "github.com/liminalpurple/vcfq/internal/vcf"
+
+// Record is one called ALT allele produced by a query. A multi-allelic VCF line
+// yields one Record per called ALT; all of them share the same Line, which the
+// vcf formatter uses to reassemble the original line with annotations injected.
 type Record struct {
-	Chrom  string
-	Pos    int
-	ID     string
-	Ref    string
-	Alt    string
-	Qual   string
-	Filter string
-	Info   string
-	Format string
-	Sample string
+	Chrom string
+	Pos   int
+	ID    string
+	Ref   string
+	Alt   string
+
+	// Line is the source VCF line, and AltIndex is Alt's 1-based position in
+	// Line.Alts.
+	Line     *vcf.DataLine
+	AltIndex int
 
 	GT    string
 	Query string

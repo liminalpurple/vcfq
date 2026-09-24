@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -40,7 +41,9 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		case "cache":
 			return runCache(args[1:], stderr)
 		case "version":
-			fmt.Fprintln(stdout, "vcfq", Version)
+			if _, err := fmt.Fprintln(stdout, "vcfq", Version); err != nil {
+				return 1
+			}
 			return 0
 		case "help", "-h", "--help":
 			printUsage(stderr)
@@ -79,41 +82,45 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	}
 
 	if vcfPath == "" {
-		fmt.Fprintln(stderr, "error: no VCF path; pass -vcf <path> or set VCFQ_VCF")
+		diag(stderr, "error: no VCF path; pass -vcf <path> or set VCFQ_VCF")
 		return 2
 	}
 
 	cache, err := ensembl.NewCache(cacheDir)
 	if err != nil {
-		fmt.Fprintln(stderr, "error:", err)
+		diag(stderr, "error:", err)
 		return 1
 	}
 
 	reader, err := vcf.Open(vcfPath)
 	if err != nil {
-		fmt.Fprintln(stderr, "error:", err)
+		diag(stderr, "error:", err)
 		return 1
 	}
-	defer reader.Close()
+	defer func() {
+		if err := reader.Close(); err != nil {
+			diag(stderr, "warning: close vcf:", err)
+		}
+	}()
 
 	formatter, err := NewFormatter(format, stdout)
 	if err != nil {
-		fmt.Fprintln(stderr, "error:", err)
+		diag(stderr, "error:", err)
 		return 2
 	}
 	if err := formatter.Header(reader.Header, annotate); err != nil {
-		fmt.Fprintln(stderr, "error: write header:", err)
+		diag(stderr, "error: write header:", err)
 		return 1
 	}
 
-	client := ensembl.NewClient()
+	client := ensembl.NewClient(Version)
 	ctx := context.Background()
 
 	var allRecords []Record
 	for _, q := range queries {
 		recs, err := resolveQuery(ctx, client, cache, reader, q)
 		if err != nil {
-			fmt.Fprintf(stderr, "warning: %s: %v\n", q, err)
+			diag(stderr, "warning: "+q+":", err)
 			continue
 		}
 		allRecords = append(allRecords, recs...)
@@ -121,26 +128,26 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 
 	if annotate && len(allRecords) > 0 {
 		if err := annotateRecords(ctx, client, cache, allRecords); err != nil {
-			fmt.Fprintln(stderr, "warning: annotation failed:", err)
+			diag(stderr, "warning: annotation failed:", err)
 		}
 	}
 
 	for _, rec := range allRecords {
 		if err := formatter.Write(rec); err != nil {
-			fmt.Fprintln(stderr, "error: write record:", err)
+			diag(stderr, "error: write record:", err)
 			return 1
 		}
 	}
 	if err := formatter.Close(); err != nil {
-		fmt.Fprintln(stderr, "error: close formatter:", err)
+		diag(stderr, "error: close formatter:", err)
 		return 1
 	}
 
 	// After the output, so it reads as a footnote to the rows rather than
 	// splitting a table header from its body on an interleaved terminal.
 	if anyNoCall(allRecords) {
-		fmt.Fprintln(stderr, "note: no variant call is not the same as homozygous reference —")
-		fmt.Fprintln(stderr, "      verify coverage on the CRAM before interpreting an absence.")
+		diag(stderr, "note: no variant call is not the same as homozygous reference —")
+		diag(stderr, "      verify coverage on the CRAM before interpreting an absence.")
 	}
 	return 0
 }
@@ -175,18 +182,24 @@ func resolveRSID(ctx context.Context, client *ensembl.Client, cache *ensembl.Cac
 	if err != nil {
 		return nil, fmt.Errorf("rsID lookup: %w", err)
 	}
-	lines, err := reader.ScanRegion(loc.Chrom, loc.Start, loc.End)
+	start, end := rsidWindow(loc)
+	lines, err := reader.ScanRegion(loc.Chrom, start, end)
 	if err != nil {
 		return nil, err
 	}
 	// Prefer records where ID matches rsid; if none match the ID exactly, return
-	// every variant overlapping the location (the VCF may not annotate this rsID
-	// but the variant is still present).
+	// every variant at the location that could be this one (the VCF may not
+	// annotate this rsID but the variant is still present). For an indel the
+	// window includes the anchor base, so a SNV sitting on that base is a
+	// neighbour, not this variant, and must not stand in for it.
 	var matched, all []Record
-	all = splitToRecords(lines, rsid)
-	for _, r := range all {
+	snv := isSNV(loc)
+	for _, r := range splitToRecords(lines, rsid) {
 		if strings.EqualFold(r.ID, rsid) {
 			matched = append(matched, r)
+		}
+		if snv || len(r.Ref) != 1 || len(r.Alt) != 1 {
+			all = append(all, r)
 		}
 	}
 	if len(matched) > 0 {
@@ -213,6 +226,30 @@ func noCallRecord(chrom string, pos int, id, ref string, alts []string, query st
 		Query:  query,
 		NoCall: true,
 	}
+}
+
+// rsidWindow converts an Ensembl variant location into the VCF positions to
+// scan. Ensembl reports indels without VCF's leading anchor base: a deletion
+// spans only the deleted bases, and an insertion has start = end+1. VCF puts
+// POS on the anchor base before them, so anything other than a plain SNV is
+// widened one base to the left.
+func rsidWindow(loc *ensembl.VariantLoc) (start, end int) {
+	if loc.Start == loc.End && isSNV(loc) {
+		return loc.Start, loc.End
+	}
+	return min(loc.Start-1, loc.End), max(loc.Start, loc.End)
+}
+
+func isSNV(loc *ensembl.VariantLoc) bool {
+	if len(loc.Ref) != 1 || loc.Ref == "-" {
+		return false
+	}
+	for _, a := range loc.Alts {
+		if len(a) != 1 || a == "-" {
+			return false
+		}
+	}
+	return true
 }
 
 var regionParseRegex = regexp.MustCompile(`^((?:chr)?[\dXYMxym]+):(\d+)(?:-(\d+))?$`)
@@ -243,33 +280,31 @@ func resolveRegion(reader *vcf.Reader, region string) ([]Record, error) {
 	return splitToRecords(lines, region), nil
 }
 
-// splitToRecords expands multi-allelic lines into one Record per ALT, computes
-// the genotype for that ALT, and tags each with the originating query string.
+// splitToRecords expands multi-allelic lines into one Record per ALT and tags
+// each with the originating query string. On multi-allelic lines only the
+// called ALTs are emitted (both of them for a 1/2 het). Lines with no called
+// ALT — hom-ref, missing, or single-allelic — emit every ALT, so users see
+// ref/ref calls at positions they explicitly queried.
 func splitToRecords(lines []vcf.DataLine, query string) []Record {
 	out := make([]Record, 0, len(lines))
-	for _, d := range lines {
+	for li := range lines {
+		d := &lines[li]
 		gt := vcf.ParseGT(d.Format, d.Sample)
-		altIdx := vcf.AltIndex(gt)
+		called := vcf.CalledAlts(gt)
 		for i, alt := range d.Alts {
-			// For multi-allelic records, only emit the ALT(s) actually called.
-			// Single-allelic records emit unconditionally so users see ref/ref
-			// calls if they explicitly queried that position.
-			if len(d.Alts) > 1 && altIdx >= 1 && i+1 != altIdx {
+			if len(d.Alts) > 1 && len(called) > 0 && !slices.Contains(called, i+1) {
 				continue
 			}
 			out = append(out, Record{
-				Chrom:  d.Chrom,
-				Pos:    d.Pos,
-				ID:     d.ID,
-				Ref:    d.Ref,
-				Alt:    alt,
-				Qual:   d.Qual,
-				Filter: d.Filter,
-				Info:   d.Info,
-				Format: d.Format,
-				Sample: d.Sample,
-				GT:     gt,
-				Query:  query,
+				Chrom:    d.Chrom,
+				Pos:      d.Pos,
+				ID:       d.ID,
+				Ref:      d.Ref,
+				Alt:      alt,
+				Line:     d,
+				AltIndex: i + 1,
+				GT:       gt,
+				Query:    query,
 			})
 		}
 	}
@@ -323,29 +358,36 @@ func annotateRecords(ctx context.Context, client *ensembl.Client, cache *ensembl
 
 func runCache(args []string, stderr io.Writer) int {
 	if len(args) == 0 {
-		fmt.Fprintln(stderr, "usage: vcfq cache clean")
+		diag(stderr, "usage: vcfq cache clean")
 		return 2
 	}
 	switch args[0] {
 	case "clean":
 		c, err := ensembl.NewCache("")
 		if err != nil {
-			fmt.Fprintln(stderr, "error:", err)
+			diag(stderr, "error:", err)
 			return 1
 		}
 		if err := c.Clean(); err != nil {
-			fmt.Fprintln(stderr, "error:", err)
+			diag(stderr, "error:", err)
 			return 1
 		}
 		return 0
 	default:
-		fmt.Fprintf(stderr, "unknown cache subcommand %q\n", args[0])
+		diag(stderr, fmt.Sprintf("unknown cache subcommand %q", args[0]))
 		return 2
 	}
 }
 
 func printUsage(w io.Writer) {
-	fmt.Fprint(w, usageText)
+	diag(w, strings.TrimSuffix(usageText, "\n"))
+}
+
+// diag writes one diagnostic line to w (normally stderr). Write errors are
+// discarded deliberately: if stderr itself is broken there is nowhere left to
+// report them, and the exit code still carries the outcome.
+func diag(w io.Writer, a ...any) {
+	_, _ = fmt.Fprintln(w, a...)
 }
 
 func printUsageTo(w io.Writer, fs *flag.FlagSet) {

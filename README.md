@@ -10,7 +10,7 @@ runtime dependencies.
 go install github.com/liminalpurple/vcfq@latest
 ```
 
-Requires Go 1.22+. The binary needs network access for Ensembl REST calls; all results are cached
+The binary needs network access for Ensembl REST calls; all results are cached
 locally so repeat queries are offline-fast.
 
 ## Quick start
@@ -81,8 +81,9 @@ passthrough).
 
 The `vcf` format is the headline: it produces a strictly richer VCF than the input. The source
 header is passed through, `##INFO=<ID=VCFQ_*>` declarations are added when `-a` is set, and
-annotations are injected into each line's INFO field. The output round-trips cleanly through
-`bcftools view` and `bcftools query`:
+annotations are injected into each line's INFO field. Multi-allelic lines are kept intact, so the
+`VCFQ_*` fields are `Number=A` — one value per ALT, `.` where an ALT wasn't called. The output
+round-trips cleanly through `bcftools view` and `bcftools query`:
 
 ```sh
 vcfq -a -f vcf HNF1A > annotated.vcf

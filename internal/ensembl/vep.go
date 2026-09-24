@@ -20,13 +20,29 @@ func (v VEPInput) Key() string {
 	return fmt.Sprintf("%s:%d:%s>%s", v.Chrom, v.Pos, v.Ref, v.Alt)
 }
 
-// region encodes a VEP input as Ensembl's required string form:
-// "chr start end ref/alt 1" (last column is strand; we always send 1 — VEP
-// resolves complementary strands itself).
-func (v VEPInput) region() string {
+// vcfInput encodes a VEP input as a VCF data line ("1 100 . A T . . ."). VCF
+// format keeps REF/ALT exactly as the source VCF has them, including the anchor
+// base on indels, so VEP normalises them itself. Ensembl names the mitochondrial
+// sequence MT rather than M.
+func (v VEPInput) vcfInput() string {
 	chrom := strings.TrimPrefix(v.Chrom, "chr")
-	end := v.Pos + len(v.Ref) - 1
-	return fmt.Sprintf("%s %d %d %s/%s 1", chrom, v.Pos, end, v.Ref, v.Alt)
+	if chrom == "M" {
+		chrom = "MT"
+	}
+	return fmt.Sprintf("%s %d . %s %s . . .", chrom, v.Pos, v.Ref, v.Alt)
+}
+
+// vepAllele returns ALT as VEP reports it after trimming the anchor base that
+// VCF indels share with REF: CTT>C becomes "-", A>AG becomes "G". SNVs are
+// returned unchanged.
+func vepAllele(ref, alt string) string {
+	if ref == "" || alt == "" || ref[0] != alt[0] {
+		return alt
+	}
+	if trimmed := alt[1:]; trimmed != "" {
+		return trimmed
+	}
+	return "-"
 }
 
 // Annotation is the subset of VEP output vcfq surfaces. AF is gnomAD genomes
@@ -60,6 +76,11 @@ type rawColocated struct {
 	Frequencies map[string]map[string]float64 `json:"frequencies"`
 }
 
+// vepCacheKind names the cache directory for VEP results. Bumped from "vep"
+// when inputs switched to VCF format: entries cached under the old encoding
+// may hold wrong annotations for indels, so they're never read again.
+const vepCacheKind = "vep2"
+
 // AnnotateBatch sends up to 200 variants per request and merges results back in
 // the input order. Variants found in cache are not re-fetched. Variants for
 // which VEP returns no consequence get a zero-value Annotation.
@@ -71,7 +92,7 @@ func (c *Client) AnnotateBatch(ctx context.Context, cache *Cache, inputs []VEPIn
 	for i, v := range inputs {
 		if cache != nil {
 			var hit Annotation
-			ok, err := cache.Get("vep", v.Key(), &hit)
+			ok, err := cache.Get(vepCacheKind, v.Key(), &hit)
 			if err == nil && ok {
 				out[i] = hit
 				continue
@@ -88,12 +109,12 @@ func (c *Client) AnnotateBatch(ctx context.Context, cache *Cache, inputs []VEPIn
 			end = len(missingInputs)
 		}
 		chunk := missingInputs[start:end]
-		regions := make([]string, len(chunk))
+		variants := make([]string, len(chunk))
 		for j, v := range chunk {
-			regions[j] = v.region()
+			variants[j] = v.vcfInput()
 		}
 		var recs []rawVEPRecord
-		body := map[string]any{"variants": regions}
+		body := map[string]any{"variants": variants}
 		// af=1 enables 1000 Genomes frequencies; af_gnomadg=1 enables gnomAD
 		// genomes frequencies. Without these, frequencies come back empty.
 		if err := c.postJSON(ctx, "/vep/human/region?af=1&af_gnomadg=1", body, &recs); err != nil {
@@ -107,14 +128,14 @@ func (c *Client) AnnotateBatch(ctx context.Context, cache *Cache, inputs []VEPIn
 		}
 		for j, v := range chunk {
 			i := missingIdx[start+j]
-			rec, ok := byInput[normaliseInput(v.region())]
+			rec, ok := byInput[normaliseInput(v.vcfInput())]
 			if !ok {
 				continue // VEP returned nothing for this variant
 			}
-			ann := buildAnnotation(rec, v.Alt)
+			ann := buildAnnotation(rec, vepAllele(v.Ref, v.Alt))
 			out[i] = ann
 			if cache != nil {
-				_ = cache.Set("vep", v.Key(), ann)
+				_ = cache.Set(vepCacheKind, v.Key(), ann)
 			}
 		}
 	}
@@ -129,7 +150,8 @@ func normaliseInput(s string) string {
 
 // buildAnnotation picks the canonical-transcript consequence when available,
 // falling back to the most-severe consequence for the variant overall. alt is
-// the ALT allele used for picking the right per-allele frequency block.
+// the ALT allele in VEP's trimmed form (see vepAllele), used to pick the right
+// per-allele frequency block.
 func buildAnnotation(r rawVEPRecord, alt string) Annotation {
 	a := Annotation{Consequence: r.MostSevere}
 	for _, tc := range r.TranscriptConsequen {

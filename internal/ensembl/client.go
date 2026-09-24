@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -27,14 +29,14 @@ type Client struct {
 }
 
 // NewClient returns a client with the default base URL, a 30s HTTP timeout, and
-// 10 rps rate limiting. The caller may override fields directly after
-// construction.
-func NewClient() *Client {
+// 10 rps rate limiting. version is reported in the User-Agent. The caller may
+// override fields directly after construction.
+func NewClient(version string) *Client {
 	dur := time.Second / time.Duration(DefaultRateLimit)
 	return &Client{
 		BaseURL:    DefaultBaseURL,
 		HTTP:       &http.Client{Timeout: 30 * time.Second},
-		UserAgent:  "vcfq/0.1 (+https://github.com/liminalpurple/vcfq)",
+		UserAgent:  "vcfq/" + version + " (+https://github.com/liminalpurple/vcfq)",
 		limiter:    time.Tick(dur),
 		limiterDur: dur,
 	}
@@ -54,93 +56,72 @@ func (c *Client) wait(ctx context.Context) error {
 	}
 }
 
-// getJSON does a GET, decoding the JSON body into dest. Returns a typed error
-// for HTTP 404s so callers can distinguish "no such symbol" from "network down".
+// getJSON does a GET, decoding the JSON body into dest.
 func (c *Client) getJSON(ctx context.Context, path string, dest any) error {
+	return c.do(ctx, http.MethodGet, path, nil, dest)
+}
+
+// postJSON sends a JSON body and decodes the JSON response.
+func (c *Client) postJSON(ctx context.Context, path string, body, dest any) error {
+	bb, err := json.Marshal(body)
+	if err != nil {
+		return err
+	}
+	return c.do(ctx, http.MethodPost, path, bb, dest)
+}
+
+// do performs one rate-limited request, decoding the JSON response into dest.
+// Returns ErrNotFound for HTTP 404s so callers can distinguish "no such symbol"
+// from "network down".
+func (c *Client) do(ctx context.Context, method, path string, body []byte, dest any) (err error) {
 	if err := c.wait(ctx); err != nil {
 		return err
 	}
 	url := c.BaseURL + path
-	if !contains(path, '?') {
+	if !strings.Contains(path, "?") {
 		url += "?content-type=application/json"
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	var rb io.Reader
+	if body != nil {
+		rb = bytes.NewReader(body)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, url, rb)
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Accept", "application/json")
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
 	req.Header.Set("User-Agent", c.UserAgent)
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
-		return fmt.Errorf("ensembl GET %s: %w", path, err)
+		return fmt.Errorf("ensembl %s %s: %w", method, path, err)
 	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
+	defer func() {
+		if cerr := resp.Body.Close(); cerr != nil {
+			err = errors.Join(err, fmt.Errorf("ensembl %s %s: close body: %w", method, path, cerr))
+		}
+	}()
+	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return fmt.Errorf("ensembl GET %s: read body: %w", path, err)
+		return fmt.Errorf("ensembl %s %s: read body: %w", method, path, err)
 	}
 	if resp.StatusCode == http.StatusNotFound {
 		return ErrNotFound
 	}
 	if resp.StatusCode >= 400 {
-		return fmt.Errorf("ensembl GET %s: status %d: %s", path, resp.StatusCode, truncate(string(body), 200))
+		return fmt.Errorf("ensembl %s %s: status %d: %s", method, path, resp.StatusCode, truncate(string(respBody), 200))
 	}
-	if err := json.Unmarshal(body, dest); err != nil {
-		return fmt.Errorf("ensembl GET %s: decode: %w", path, err)
-	}
-	return nil
-}
-
-// postJSON sends a JSON body and decodes the JSON response.
-func (c *Client) postJSON(ctx context.Context, path string, body, dest any) error {
-	if err := c.wait(ctx); err != nil {
-		return err
-	}
-	bb, err := json.Marshal(body)
-	if err != nil {
-		return err
-	}
-	url := c.BaseURL + path
-	if !contains(path, '?') {
-		url += "?content-type=application/json"
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(bb))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", c.UserAgent)
-	resp, err := c.HTTP.Do(req)
-	if err != nil {
-		return fmt.Errorf("ensembl POST %s: %w", path, err)
-	}
-	defer resp.Body.Close()
-	rb, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return fmt.Errorf("ensembl POST %s: read body: %w", path, err)
-	}
-	if resp.StatusCode >= 400 {
-		return fmt.Errorf("ensembl POST %s: status %d: %s", path, resp.StatusCode, truncate(string(rb), 200))
-	}
-	if err := json.Unmarshal(rb, dest); err != nil {
-		return fmt.Errorf("ensembl POST %s: decode: %w", path, err)
+	if err := json.Unmarshal(respBody, dest); err != nil {
+		return fmt.Errorf("ensembl %s %s: decode: %w", method, path, err)
 	}
 	return nil
 }
 
 // ErrNotFound is returned when Ensembl responds with HTTP 404 — typically an
 // unknown symbol or rsID.
-var ErrNotFound = fmt.Errorf("not found")
-
-func contains(s string, b byte) bool {
-	for i := 0; i < len(s); i++ {
-		if s[i] == b {
-			return true
-		}
-	}
-	return false
-}
+var ErrNotFound = errors.New("not found")
 
 func truncate(s string, n int) string {
 	if len(s) <= n {

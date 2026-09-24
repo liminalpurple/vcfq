@@ -1,0 +1,13 @@
+##fileformat=VCFv4.2
+##contig=<ID=chr1,length=248956422>
+##contig=<ID=chr2,length=242193529>
+##INFO=<ID=AC,Number=A,Type=Integer,Description="Allele count in genotypes">
+##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">
+##FORMAT=<ID=DP,Number=1,Type=Integer,Description="Read depth">
+#CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO	FORMAT	SAMPLE
+chr1	11796321	rs1801133	G	A	50	PASS	AC=2	GT:DP	1/1:30
+chr1	20000100	rs900001	CTT	C	50	PASS	AC=1	GT:DP	0/1:28
+chr1	20000200	.	A	AG	50	PASS	AC=1	GT:DP	0/1:31
+chr1	20000300	.	G	A,T	50	PASS	AC=1,1	GT:DP	1/2:25
+chr1	20000400	.	C	G,A	50	PASS	AC=0,1	GT:DP	0/2:27
+chr2	100	.	A	C	50	PASS	AC=1	GT:DP	0/1:20
