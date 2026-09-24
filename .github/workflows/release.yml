@@ -32,8 +32,25 @@ jobs:
           GOOS=windows GOARCH=amd64 go build -ldflags "${ldflags}" -o "dist/vcfq-windows-amd64.exe" .
           GOOS=windows GOARCH=arm64 go build -ldflags "${ldflags}" -o "dist/vcfq-windows-arm64.exe" .
 
+      # checkout leaves the tag as a bare commit, so fetch the annotated tag to
+      # read its message. The body is hard-wrapped, and GitHub renders single
+      # newlines in release notes as line breaks, so wrapped lines are rejoined.
+      - name: Read tag message
+        id: tag
+        run: |
+          git fetch --force origin "refs/tags/${GITHUB_REF_NAME}:refs/tags/${GITHUB_REF_NAME}"
+          echo "title=$(git tag -l --format='%(contents:subject)' "${GITHUB_REF_NAME}")" >> "$GITHUB_OUTPUT"
+          git tag -l --format='%(contents:body)' "${GITHUB_REF_NAME}" | awk '
+            /^$/  { if (buf != "") print buf; buf = ""; print ""; next }
+            /^- / { if (buf != "") print buf; buf = $0; next }
+            /^  +[^ ]/ && buf ~ /^- / { sub(/^ +/, ""); buf = buf " " $0; next }
+                  { buf = (buf == "") ? $0 : buf " " $0 }
+            END   { if (buf != "") print buf }' > dist/NOTES.md
+
       - name: Create release
         uses: softprops/action-gh-release@v3
         with:
+          name: ${{ steps.tag.outputs.title }}
+          body_path: dist/NOTES.md
           generate_release_notes: true
-          files: dist/*
+          files: dist/vcfq-*
