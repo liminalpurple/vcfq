@@ -4,8 +4,6 @@ on:
   push:
     tags: ["v*"]
 
-permissions:
-  contents: write
 
 jobs:
   release:
@@ -33,9 +31,10 @@ jobs:
           GOOS=windows GOARCH=arm64 go build -ldflags "${ldflags}" -o "dist/vcfq-windows-arm64.exe" .
 
       # checkout leaves the tag as a bare commit, so fetch the annotated tag to
-      # read its message. The body is hard-wrapped, and GitHub renders single
+      # read its message. The body is hard-wrapped, and Forgejo renders single
       # newlines in release notes as line breaks, so wrapped lines are rejoined.
       - name: Read tag message
+        id: notes
         run: |
           git fetch --force origin "refs/tags/${GITHUB_REF_NAME}:refs/tags/${GITHUB_REF_NAME}"
           git tag -l --format='%(contents:body)' "${GITHUB_REF_NAME}" | awk '
@@ -43,11 +42,20 @@ jobs:
             /^- / { if (buf != "") print buf; buf = $0; next }
             /^  +[^ ]/ && buf ~ /^- / { sub(/^ +/, ""); buf = buf " " $0; next }
                   { buf = (buf == "") ? $0 : buf " " $0 }
-            END   { if (buf != "") print buf }' > dist/NOTES.md
+            END   { if (buf != "") print buf }' > NOTES.md
+          {
+            echo 'notes<<__NOTES__'
+            cat NOTES.md
+            echo '__NOTES__'
+          } >> "$GITHUB_OUTPUT"
 
       - name: Create release
-        uses: softprops/action-gh-release@v3
+        uses: https://code.forgejo.org/actions/forgejo-release@v2
         with:
-          body_path: dist/NOTES.md
-          generate_release_notes: true
-          files: dist/vcfq-*
+          direction: upload
+          url: ${{ github.server_url }}
+          repo: ${{ github.repository }}
+          token: ${{ github.token }}
+          tag: ${{ github.ref_name }}
+          release-dir: dist
+          release-notes: ${{ steps.notes.outputs.notes }}
